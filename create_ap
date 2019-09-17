@@ -42,8 +42,11 @@ usage() {
     echo "                               'none' for no Internet sharing (equivalent to -n)"
     echo "  --psk                   Use 64 hex digits pre-shared-key instead of passphrase"
     echo "  --hidden                Make the Access Point hidden (do not broadcast the SSID)"
-    echo "  --mac-filter            Enable MAC address filtering"
-    echo "  --mac-filter-accept     Location of MAC address filter list (defaults to /etc/hostapd/hostapd.accept)"
+    echo "  --mac-filter <type>     Enable MAC address filtering (can be# used with driver=hostap or driver=nl80211, but not with driver=atheros)"
+    echo "                                     0 = accept unless in deny list"
+    echo "                                     1 = deny unless in accept list"
+    echo "  --mac-filter-accept          Location of MAC address accept list (defaults to /etc/hostapd/hostapd.accept)"
+    echo "  --mac-filter-deny            Location of MAC address deny list (defaults to /etc/hostapd/hostapd.deny)"
     echo "  --redirect-to-localhost If -n is set, redirect every web request to localhost (useful for public information networks)"
     echo "  --hostapd-debug <level> With level between 1 and 2, passes arguments -d or -dd to hostapd for debugging."
     echo "  --isolate-clients       Disable communication between clients"
@@ -75,10 +78,8 @@ usage() {
     echo
     echo "Non-Bridging Options:"
     echo "  --no-dns                Disable dnsmasq DNS server"
-    echo "  --no-dnsmasq            Disable dnsmasq server completely"
     echo "  -g <gateway>            IPv4 Gateway for the Access Point (default: 192.168.12.1)"
     echo "  -d                      DNS server will take into account /etc/hosts"
-    echo "  -e <hosts_file>         DNS server will take into account additional hosts file"
     echo
     echo "Useful informations:"
     echo "  * If you're not using the --no-virt option, then you can create an AP with the same"
@@ -608,14 +609,12 @@ CHANNEL=default
 GATEWAY=192.168.12.1
 WPA_VERSION=1+2
 ETC_HOSTS=0
-ADDN_HOSTS=
 DHCP_DNS=gateway
 NO_DNS=0
-NO_DNSMASQ=0
-DNS_PORT=
 HIDDEN=0
-MAC_FILTER=0
+MAC_FILTER=
 MAC_FILTER_ACCEPT=/etc/hostapd/hostapd.accept
+MAC_FILTER_DENY=/etc/hostapd/hostapd.deny
 ISOLATE_CLIENTS=0
 SHARE_METHOD=nat
 IEEE80211N=0
@@ -634,7 +633,7 @@ USE_PSK=0
 HOSTAPD_DEBUG_ARGS=
 REDIRECT_TO_LOCALHOST=0
 
-CONFIG_OPTS=(CHANNEL GATEWAY WPA_VERSION ETC_HOSTS DHCP_DNS NO_DNS NO_DNSMASQ HIDDEN MAC_FILTER MAC_FILTER_ACCEPT ISOLATE_CLIENTS
+CONFIG_OPTS=(CHANNEL GATEWAY WPA_VERSION ETC_HOSTS DHCP_DNS NO_DNS HIDDEN MAC_FILTER MAC_FILTER_ACCEPT MAC_FILTER_DENY ISOLATE_CLIENTS
              SHARE_METHOD IEEE80211N IEEE80211AC HT_CAPAB VHT_CAPAB DRIVER NO_VIRT COUNTRY FREQ_BAND
              NEW_MACADDR DAEMONIZE NO_HAVEGED WIFI_IFACE INTERNET_IFACE
              SSID PASSPHRASE USE_PSK)
@@ -717,7 +716,7 @@ _cleanup() {
 
     if [[ "$SHARE_METHOD" != "none" ]]; then
         if [[ "$SHARE_METHOD" == "nat" ]]; then
-            iptables -w -t nat -D POSTROUTING -s ${GATEWAY%.*}.0/24 ! -o ${WIFI_IFACE} -j MASQUERADE
+            iptables -w -t nat -D POSTROUTING -s ${GATEWAY%.*}.0/24 ! -o ${WIFI_IFACE} -j MASQUERADE || die
             iptables -w -D FORWARD -i ${WIFI_IFACE} -s ${GATEWAY%.*}.0/24 -j ACCEPT
             iptables -w -D FORWARD -i ${INTERNET_IFACE} -d ${GATEWAY%.*}.0/24 -j ACCEPT
         elif [[ "$SHARE_METHOD" == "bridge" ]]; then
@@ -761,12 +760,12 @@ _cleanup() {
 
     if [[ "$SHARE_METHOD" != "bridge" ]]; then
         if [[ $NO_DNS -eq 0 ]]; then
-            iptables -w -D INPUT -p tcp -m tcp --dport $DNS_PORT -j ACCEPT
-            iptables -w -D INPUT -p udp -m udp --dport $DNS_PORT -j ACCEPT
+            iptables -w -D INPUT -p tcp -m tcp --dport 5353 -j ACCEPT
+            iptables -w -D INPUT -p udp -m udp --dport 5353 -j ACCEPT
             iptables -w -t nat -D PREROUTING -s ${GATEWAY%.*}.0/24 -d ${GATEWAY} \
-                -p tcp -m tcp --dport 53 -j REDIRECT --to-ports $DNS_PORT
+                -p tcp -m tcp --dport 53 -j REDIRECT --to-ports 5353
             iptables -w -t nat -D PREROUTING -s ${GATEWAY%.*}.0/24 -d ${GATEWAY} \
-                -p udp -m udp --dport 53 -j REDIRECT --to-ports $DNS_PORT
+                -p udp -m udp --dport 53 -j REDIRECT --to-ports 5353
         fi
         iptables -w -D INPUT -p udp -m udp --dport 67 -j ACCEPT
     fi
@@ -1028,7 +1027,7 @@ for ((i=0; i<$#; i++)); do
     fi
 done
 
-GETOPT_ARGS=$(getopt -o hc:w:g:de:nm: -l "help","hidden","hostapd-debug:","redirect-to-localhost","mac-filter","mac-filter-accept:","isolate-clients","ieee80211n","ieee80211ac","ht_capab:","vht_capab:","driver:","no-virt","fix-unmanaged","country:","freq-band:","mac:","dhcp-dns:","daemon","stop:","list","list-running","list-clients:","version","psk","no-haveged","no-dns","no-dnsmasq","mkconfig:","config:" -n "$PROGNAME" -- "$@")
+GETOPT_ARGS=$(getopt -o hc:w:g:dnm: -l "help","hidden","hostapd-debug:","redirect-to-localhost","mac-filter:","mac-filter-accept:","mac-filter-deny:","isolate-clients","ieee80211n","ieee80211ac","ht_capab:","vht_capab:","driver:","no-virt","fix-unmanaged","country:","freq-band:","mac:","dhcp-dns:","daemon","stop:","list","list-running","list-clients:","version","psk","no-haveged","no-dns","mkconfig:","config:" -n "$PROGNAME" -- "$@")
 [[ $? -ne 0 ]] && exit 1
 eval set -- "$GETOPT_ARGS"
 
@@ -1048,11 +1047,17 @@ while :; do
             ;;
         --mac-filter)
             shift
-            MAC_FILTER=1
+            MAC_FILTER=$1
+            shift
             ;;
         --mac-filter-accept)
             shift
             MAC_FILTER_ACCEPT="$1"
+            shift
+            ;;
+        --mac-filter-deny)
+            shift
+            MAC_FILTER_DENY="$1"
             shift
             ;;
         --isolate-clients)
@@ -1078,11 +1083,6 @@ while :; do
         -d)
             shift
             ETC_HOSTS=1
-            ;;
-        -e)
-            shift
-            ADDN_HOSTS="$1"
-            shift
             ;;
         -n)
             shift
@@ -1179,10 +1179,6 @@ while :; do
             shift
             NO_DNS=1
             ;;
-        --no-dnsmasq)
-            shift
-            NO_DNSMASQ=1
-            ;;
         --redirect-to-localhost)
             shift
             REDIRECT_TO_LOCALHOST=1
@@ -1234,11 +1230,6 @@ if [[ $# -lt 1 && $FIX_UNMANAGED -eq 0  && -z "$STOP_ID" &&
       $LIST_RUNNING -eq 0 && -z "$LIST_CLIENTS_ID" ]]; then
     usage >&2
     exit 1
-fi
-
-# Set NO_DNS, if dnsmasq is disabled
-if [[ $NO_DNSMASQ -eq 1 ]]; then
-  NO_DNS=1
 fi
 
 trap "cleanup_lock" EXIT
@@ -1590,7 +1581,9 @@ fi
 
 [[ $HIDDEN -eq 1 ]] && echo "Access Point's SSID is hidden!"
 
-[[ $MAC_FILTER -eq 1 ]] && echo "MAC address filtering is enabled!"
+[[ $MAC_FILTER -eq 0 ]] && echo "MAC address filtering (deny list) is enabled!"
+
+[[ $MAC_FILTER -eq 1 ]] && echo "MAC address filtering (accept list) is enabled!"
 
 [[ $ISOLATE_CLIENTS -eq 1 ]] && echo "Access Point's clients will be isolated!"
 
@@ -1624,6 +1617,13 @@ if [[ $MAC_FILTER -eq 1 ]]; then
     cat << EOF >> $CONFDIR/hostapd.conf
 macaddr_acl=${MAC_FILTER}
 accept_mac_file=${MAC_FILTER_ACCEPT}
+EOF
+fi
+
+if [[ $MAC_FILTER -eq 0 ]]; then
+    cat << EOF >> $CONFDIR/hostapd.conf
+macaddr_acl=${MAC_FILTER}
+deny_mac_file=${MAC_FILTER_DENY}
 EOF
 fi
 
@@ -1664,7 +1664,7 @@ fi
 
 if [[ "$SHARE_METHOD" == "bridge" ]]; then
     echo "bridge=${BRIDGE_IFACE}" >> $CONFDIR/hostapd.conf
-elif [[ $NO_DNSMASQ -eq 0 ]]; then
+else
     # dnsmasq config (dhcp + dns)
     DNSMASQ_VER=$(dnsmasq -v | grep -m1 -oE '[0-9]+(\.[0-9]+)*\.[0-9]+')
     version_cmp $DNSMASQ_VER 2.63
@@ -1686,7 +1686,6 @@ EOF
     MTU=$(get_mtu $INTERNET_IFACE)
     [[ -n "$MTU" ]] && echo "dhcp-option-force=option:mtu,${MTU}" >> $CONFDIR/dnsmasq.conf
     [[ $ETC_HOSTS -eq 0 ]] && echo no-hosts >> $CONFDIR/dnsmasq.conf
-    [[ -n "$ADDN_HOSTS" ]] && echo "addn-hosts=${ADDN_HOSTS}" >> $CONFDIR/dnsmasq.conf
     if [[ "$SHARE_METHOD" == "none" && "$REDIRECT_TO_LOCALHOST" == "1" ]]; then
         cat << EOF >> $CONFDIR/dnsmasq.conf
 address=/#/$GATEWAY
@@ -1810,20 +1809,17 @@ if [[ "$SHARE_METHOD" != "bridge" ]]; then
     else
         DNS_PORT=0
     fi
+    iptables -w -I INPUT -p udp -m udp --dport 67 -j ACCEPT || die
 
-    if [[ $NO_DNSMASQ -eq 0 ]]; then
-      iptables -w -I INPUT -p udp -m udp --dport 67 -j ACCEPT || die
-
-      if which complain > /dev/null 2>&1; then
-          # openSUSE's apparmor does not allow dnsmasq to read files.
-          # remove restriction.
-          complain dnsmasq
-      fi
-
-      umask 0033
-      dnsmasq -C $CONFDIR/dnsmasq.conf -x $CONFDIR/dnsmasq.pid -l $CONFDIR/dnsmasq.leases -p $DNS_PORT || die
-      umask $SCRIPT_UMASK
+    if which complain > /dev/null 2>&1; then
+        # openSUSE's apparmor does not allow dnsmasq to read files.
+        # remove restriction.
+        complain dnsmasq
     fi
+
+    umask 0033
+    dnsmasq -C $CONFDIR/dnsmasq.conf -x $CONFDIR/dnsmasq.pid -l $CONFDIR/dnsmasq.leases -p $DNS_PORT || die
+    umask $SCRIPT_UMASK
 fi
 
 # start access point
@@ -1834,12 +1830,8 @@ if [[ $NO_HAVEGED -eq 0 ]]; then
     HAVEGED_WATCHDOG_PID=$!
 fi
 
-# start hostapd (use stdbuf when available for no delayed output in programs that redirect stdout)
-STDBUF_PATH=`which stdbuf`
-if [ $? -eq 0 ]; then
-    STDBUF_PATH=$STDBUF_PATH" -oL"
-fi
-$STDBUF_PATH $HOSTAPD $HOSTAPD_DEBUG_ARGS $CONFDIR/hostapd.conf &
+# start hostapd (use stdbuf for no delayed output in programs that redirect stdout)
+stdbuf -oL $HOSTAPD $HOSTAPD_DEBUG_ARGS $CONFDIR/hostapd.conf &
 HOSTAPD_PID=$!
 echo $HOSTAPD_PID > $CONFDIR/hostapd.pid
 
